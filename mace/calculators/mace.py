@@ -379,6 +379,35 @@ class MACECalculator(Calculator):
         batch = next(iter(data_loader)).to(self.device)
         return batch
 
+    def _atoms_list_to_batch(self, atoms_list):
+        """Convert a list of ase.Atoms objects to a batched tensor."""
+        self.arrays_keys.update({self.charges_key: "charges"})
+        keyspec = data.KeySpecification(
+            info_keys=self.info_keys, arrays_keys=self.arrays_keys
+        )
+        configs = [
+            data.config_from_atoms(
+                atoms, key_specification=keyspec, head_name=self.head
+            )
+            for atoms in atoms_list
+        ]
+        data_loader = torch_geometric.dataloader.DataLoader(
+            dataset=[
+                data.AtomicData.from_config(
+                    config,
+                    z_table=self.z_table,
+                    cutoff=self.r_max,
+                    heads=self.available_heads,
+                )
+                for config in configs
+            ],
+            batch_size=len(atoms_list),
+            shuffle=False,
+            drop_last=False,
+        )
+        batch = next(iter(data_loader)).to(self.device)
+        return batch
+
     def _clone_batch(self, batch):
         batch_clone = batch.clone()
         if self.use_compile:
@@ -592,12 +621,37 @@ class MACECalculator(Calculator):
             return hessians[0]
         return hessians
 
+    def reconstruct_descriptors_by_structure(self, descriptors, structure_indices):
+        """Helper method to reconstruct descriptors grouped by structure.
+        
+        :param descriptors: np.ndarray of shape (num_total_atoms, num_features)
+        :param structure_indices: np.ndarray of shape (num_total_atoms,) indicating which structure each atom belongs to
+        :return: list of np.ndarray, where each array contains descriptors for one structure
+        """
+        unique_structures = np.unique(structure_indices)
+        descriptors_by_structure = []
+        
+        for struct_idx in unique_structures:
+            mask = structure_indices == struct_idx
+            struct_descriptors = descriptors[mask]
+            descriptors_by_structure.append(struct_descriptors)
+        
+        return descriptors_by_structure
+
     def get_descriptors(self, atoms=None, invariants_only=True, num_layers=-1):
         """Extracts the descriptors from MACE model.
-        :param atoms: ase.Atoms object
+        :param atoms: ase.Atoms object or list[ase.Atoms] objects. If a list is provided, 
+                     the atoms will be processed as a batch for efficiency.
         :param invariants_only: bool, if True only the invariant descriptors are returned
         :param num_layers: int, number of layers to extract descriptors from, if -1 all layers are used
-        :return: np.ndarray (num_atoms, num_interactions, invariant_features) of invariant descriptors if num_models is 1 or list[np.ndarray] otherwise
+        :return: If num_models is 1:
+                    - Single atoms: np.ndarray (num_atoms, num_interactions, invariant_features)
+                    - Batch atoms: tuple of (np.ndarray, np.ndarray) where first is descriptors and second is structure indices
+                 If num_models > 1:
+                    - Single atoms: list[np.ndarray] of descriptors
+                    - Batch atoms: list of tuples, each containing (descriptors, structure_indices)
+                 
+                 The structure_indices tensor has shape (num_total_atoms,) and contains the index of which structure each atom belongs to.
         """
         if atoms is None and self.atoms is None:
             raise ValueError("atoms not set")
@@ -605,10 +659,25 @@ class MACECalculator(Calculator):
             atoms = self.atoms
         if self.model_type != "MACE":
             raise NotImplementedError("Only implemented for MACE models")
+        
+        # Handle both single atoms and list of atoms
+        is_batch = isinstance(atoms, list)
+        if not is_batch:
+            atoms = [atoms]
+        
         num_interactions = int(self.models[0].num_interactions)
         if num_layers == -1:
             num_layers = num_interactions
-        batch = self._atoms_to_batch(atoms)
+        
+        # Use appropriate batch method
+        if is_batch:
+            batch = self._atoms_list_to_batch(atoms)
+            # Create structure indices tensor
+            structure_indices = batch["batch"].detach().cpu().numpy()
+        else:
+            batch = self._atoms_to_batch(atoms[0])
+            structure_indices = None
+        
         descriptors = [model(batch.to_dict())["node_feats"] for model in self.models]
 
         irreps_out = o3.Irreps(str(self.models[0].products[0].linear.irreps_out))
@@ -635,5 +704,12 @@ class MACECalculator(Calculator):
         ]
 
         if self.num_models == 1:
-            return descriptors[0]
-        return descriptors
+            if is_batch:
+                return descriptors[0], structure_indices
+            else:
+                return descriptors[0]
+        else:
+            if is_batch:
+                return [(desc, structure_indices) for desc in descriptors]
+            else:
+                return descriptors
